@@ -1,6 +1,6 @@
 {
   "name": "dsh-selection-translator",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Right-click selected text in the DeepSeek Harness Web UI to translate it in place, and restore the original with one more right-click.",
   "type": "module",
   "license": "MIT",

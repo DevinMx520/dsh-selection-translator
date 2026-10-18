@@ -1,17 +1,23 @@
 /**
  * Host half of the selection translator.
  *
- * The browser cannot call translation providers directly (CORS plus no
- * credential handling), so it posts the selected text to this same-origin
- * route. Translation itself is delegated to the Host `translator` service.
- * That service is composed for Agent contexts, so the route looks it up on the
- * root context first and then on every live Agent context.
+ * The browser posts selected fragments to this same-origin route. Translation
+ * is delegated to the Host `translator` service; long fragments are split into
+ * provider-sized chunks and translated in order, so the browser never has to
+ * reject a selection as "too long".
  */
 export const name = 'selection-translator'
 export const inject = ['webServer', 'translator']
 
 const ROUTE_PATH = '/api/dsh/selection-translator'
-const MAX_TEXT_CHARS = 6000
+const MAX_TEXTS = 24
+const CHUNK_CHARS = 3500
+const CONCURRENCY = 3
+const CACHE_LIMIT = 300
+const REQUEST_TIMEOUT_MS = 20_000
+
+/** Successful whole-fragment translations, capped to keep memory bounded. */
+const cache = new Map()
 
 function json(res, status, body) {
   res.writeHead(status, {
@@ -34,7 +40,7 @@ function sameOrigin(req) {
   }
 }
 
-function readBody(req, limit = 128 * 1024) {
+function readBody(req, limit = 1024 * 1024) {
   return new Promise((resolve, reject) => {
     const chunks = []
     let size = 0
@@ -71,10 +77,7 @@ function getService(scope, key) {
   }
 }
 
-/**
- * The translator is provided to Agent compositions. Prefer the root service
- * when a composition places it there, otherwise reuse a live Agent's service.
- */
+/** The translator is composed for Agent contexts; root is preferred. */
 function translatorScopes(ctx) {
   const candidates = []
   const root = getService(ctx, 'translator')
@@ -96,14 +99,6 @@ function translatorScopes(ctx) {
   return candidates
 }
 
-/** Anonymous providers are the only ones this route may use without a Session. */
-const ANONYMOUS_PROVIDERS = ['bing', 'google']
-
-function pickProviders(available) {
-  if (!Array.isArray(available)) return []
-  return ANONYMOUS_PROVIDERS.filter((provider) => available.includes(provider))
-}
-
 /** Whether the browser module loader advertised this package's client half. */
 function clientModuleState(ctx) {
   const clientModules = getService(ctx, 'clientModules')
@@ -115,38 +110,137 @@ function clientModuleState(ctx) {
   }
 }
 
-/**
- * Translate one fragment. The service normalizes provider-specific language
- * tags, but the target tag differs between providers in older Harness builds,
- * so a small ordered list keeps both generations working.
- */
-async function translateWithService(translator, text, signal) {
-  const available = await translator.availableProviders(signal)
-  const providers = pickProviders(available)
-  if (providers.length === 0) {
-    const error = new Error('no-anonymous-translation-provider')
-    error.available = Array.isArray(available) ? available : []
-    throw error
+/** Anonymous providers are the only ones this route may use without a Session. */
+const ANONYMOUS_PROVIDERS = ['bing', 'google']
+
+function pickProviders(available) {
+  if (!Array.isArray(available)) return []
+  return ANONYMOUS_PROVIDERS.filter((provider) => available.includes(provider))
+}
+
+/** Prefer a paragraph/sentence boundary and never split a surrogate pair. */
+function findCut(text, limit) {
+  const windowText = text.slice(0, limit)
+  let index = windowText.lastIndexOf('\n\n')
+  if (index >= limit * 0.5) return index + 2
+
+  const sentence = /[.!?。！？；;]\s+/g
+  let last = -1
+  let match
+  while ((match = sentence.exec(windowText)) !== null) last = match.index + match[0].length
+  if (last >= limit * 0.5) return last
+
+  index = Math.max(windowText.lastIndexOf('\n'), windowText.lastIndexOf(' '))
+  if (index >= limit * 0.5) return index + 1
+
+  let cut = limit
+  const code = text.charCodeAt(cut - 1)
+  if (code >= 0xd800 && code <= 0xdbff) cut -= 1
+  return cut
+}
+
+function splitText(text, limit) {
+  if (text.length <= limit) return [text]
+  const chunks = []
+  let rest = text
+  while (rest.length > limit) {
+    const cut = findCut(rest, limit)
+    chunks.push(rest.slice(0, cut))
+    rest = rest.slice(cut)
   }
+  if (rest !== '') chunks.push(rest)
+  return chunks
+}
+
+async function translateChunk(session, text, signal) {
   let lastError
-  for (const provider of providers) {
+  for (const provider of session.providers) {
     for (const targetLanguage of ['zh', 'zh-CN', 'zh-Hans']) {
       try {
-        const spec = translator.resolve({
-          text,
-          targetLanguage,
-          provider,
-        })
-        const translated = await translator.translate(spec, signal)
-        if (typeof translated === 'string' && translated.trim() !== '') {
-          return { text: translated.trim(), provider }
-        }
+        const spec = session.translator.resolve({ text, targetLanguage, provider })
+        const translated = await session.translator.translate(spec, signal)
+        if (typeof translated === 'string' && translated.trim() !== '') return translated.trim()
       } catch (error) {
         lastError = error
       }
     }
   }
   throw lastError instanceof Error ? lastError : new Error('translation-failed')
+}
+
+function remember(key, value) {
+  if (cache.size >= CACHE_LIMIT) {
+    const oldest = cache.keys().next().value
+    if (oldest !== undefined) cache.delete(oldest)
+  }
+  cache.set(key, value)
+}
+
+async function translateWithSession(session, text, signal) {
+  const cached = cache.get(text)
+  if (cached !== undefined) return cached
+  const parts = []
+  for (const chunk of splitText(text, CHUNK_CHARS)) {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+    let merged = controller.signal
+    if (signal !== undefined) {
+      try {
+        merged = AbortSignal.any([signal, controller.signal])
+      } catch {
+        merged = controller.signal
+      }
+    }
+    try {
+      parts.push(await translateChunk(session, chunk, merged))
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+  const translated = parts.join('')
+  remember(text, translated)
+  return translated
+}
+
+async function translateText(sessions, text, signal) {
+  if (text.trim() === '') return ''
+  let lastError
+  for (const session of sessions) {
+    try {
+      return await translateWithSession(session, text, signal)
+    } catch (error) {
+      lastError = error
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error('translation-failed')
+}
+
+async function translateBatch(sessions, texts, signal) {
+  const results = new Array(texts.length)
+  let cursor = 0
+  const workers = Array.from({ length: Math.min(CONCURRENCY, texts.length) }, async () => {
+    while (true) {
+      const index = cursor
+      cursor += 1
+      if (index >= texts.length) return
+      const text = texts[index]
+      if (typeof text !== 'string') {
+        results[index] = { ok: false, error: 'invalid-text' }
+        continue
+      }
+      if (text.trim() === '') {
+        results[index] = { ok: true, text: '' }
+        continue
+      }
+      try {
+        results[index] = { ok: true, text: await translateText(sessions, text, signal) }
+      } catch (error) {
+        results[index] = { ok: false, error: describeError(error) }
+      }
+    }
+  })
+  await Promise.all(workers)
+  return results
 }
 
 export function apply(ctx) {
@@ -159,8 +253,9 @@ export function apply(ctx) {
         return
       }
 
+      const scopes = translatorScopes(ctx)
+
       if (req.method === 'GET') {
-        const scopes = translatorScopes(ctx)
         const providers = []
         for (const scope of scopes) {
           try {
@@ -188,48 +283,58 @@ export function apply(ctx) {
         return
       }
 
+      const controller = new AbortController()
+      req.on('aborted', () => controller.abort())
+      res.on('close', () => {
+        if (!res.writableEnded) controller.abort()
+      })
+
       try {
+        let sessions = []
+        for (const scope of scopes) {
+          try {
+            const available = await scope.translator.availableProviders(controller.signal)
+            const providers = pickProviders(available)
+            if (providers.length > 0) sessions.push({ translator: scope.translator, providers })
+          } catch {
+            /* an unusable scope is skipped */
+          }
+        }
+        if (sessions.length === 0) {
+          json(res, 503, { ok: false, error: 'no-anonymous-translation-provider' })
+          return
+        }
+
         const body = await readBody(req)
-        const text = typeof body === 'object' && body !== null ? body.text : undefined
-        if (typeof text !== 'string' || text.trim() === '') {
+
+        if (Array.isArray(body.texts)) {
+          const texts = body.texts
+          if (texts.length === 0) {
+            json(res, 400, { ok: false, error: 'empty-texts' })
+            return
+          }
+          if (texts.length > MAX_TEXTS) {
+            json(res, 400, { ok: false, error: 'too-many-texts', maxTexts: MAX_TEXTS })
+            return
+          }
+          const results = await translateBatch(sessions, texts, controller.signal)
+          json(res, 200, { ok: true, results })
+          return
+        }
+
+        const text = typeof body.text === 'string' ? body.text.trim() : ''
+        if (text === '') {
           json(res, 400, { ok: false, error: 'empty-text' })
           return
         }
-        const trimmed = text.trim()
-        const scopes = translatorScopes(ctx)
-        if (scopes.length === 0) {
-          json(res, 503, { ok: false, error: 'translator-service-unavailable' })
-          return
-        }
-        const serviceLimit = scopes[0].translator.maxTextChars
-        const limit = Number.isFinite(serviceLimit) && serviceLimit > 0
-          ? Math.min(MAX_TEXT_CHARS, serviceLimit)
-          : MAX_TEXT_CHARS
-        if (trimmed.length > limit) {
-          json(res, 413, { ok: false, error: 'text-too-long', maxTextChars: limit })
-          return
-        }
-        let lastError
-        for (const scope of scopes) {
-          const controller = new AbortController()
-          const timer = setTimeout(() => controller.abort(), 20_000)
-          try {
-            const result = await translateWithService(scope.translator, trimmed, controller.signal)
-            json(res, 200, { ok: true, text: result.text, provider: result.provider, scope: scope.label })
-            return
-          } catch (error) {
-            lastError = error
-          } finally {
-            clearTimeout(timer)
-          }
-        }
-        throw lastError instanceof Error ? lastError : new Error('translation-failed')
+        const translated = await translateText(sessions, text, controller.signal)
+        json(res, 200, { ok: true, text: translated })
       } catch (error) {
-        json(res, 500, {
-          ok: false,
-          error: describeError(error),
-          available: Array.isArray(error?.available) ? error.available : undefined,
-        })
+        if (controller.signal.aborted) {
+          json(res, 499, { ok: false, error: 'aborted' })
+          return
+        }
+        json(res, 500, { ok: false, error: describeError(error) })
       }
     },
   }

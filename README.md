@@ -39,17 +39,18 @@ dsh-selection-translator
 
 ## 已知限制
 
-- 机器翻译可能改动排版、代码或专有名词。
-- 跨多个段落的选区会被替换成一个中文片段，而不是逐段替换。
+- 按段落/文本节点分别翻译，长文本会自动分段，翻译过程中菜单里显示进度条；极短片段（尤其是被行内代码切开的两段）译文可能不如整段通顺。
+- 完整选中的段落会保留段落、标题、列表和行内代码/代码块；加粗、链接等不承载代码语义的内联样式会被拍平。
 - 消息被 React 重新渲染（例如流式输出或切换会话）时，翻译片段可能丢失，原文会重新出现；重新翻译即可。
-- 单次翻译上限约 4000 个字符（Bing 匿名通道）。
 - 插件会插入 `@deepseek-ai/dsh-experimental-translator` 行；如果其他 bundle 也挂载了 translator，可能产生服务冲突。
 - 百度翻译的公开接口需要 appid 和签名，本插件没有使用百度。
 
 ## 工作原理
 
 - `client.js`：在 `shell.overlay` 槽位注册浮动菜单。Electron 桌面端的「复制」菜单由主进程生成，仅靠 DOM 的 `preventDefault()` 无法压制，因此右键按下时先保存选区再清空选区，让原生菜单没有可显示条目。
-- `index.js`：Host 半注册同源路由 `POST /api/dsh/selection-translator`，调用 Harness 的 `translator` 服务把文本翻译成中文。
+  - 完整选中的段落整段翻译，行内代码/代码块用占位符保留并原样放回；不完整的段落按文本节点逐段替换，保留原有 DOM 结构。
+  - 长文本按 8 个片段一批发送，菜单里显示进度条；关闭菜单会取消进行中的翻译。
+- `index.js`：Host 半注册同源路由 `POST /api/dsh/selection-translator`，调用 Harness 的 `translator` 服务把文本翻译成中文；超过 3500 字符的片段会自动切块翻译后拼接。
 - `cordis.patch.yml`：同时挂载 translator 服务和本插件。
 
 ## 开发与发布

@@ -7,15 +7,20 @@ window.__ModuleLoader__.load({
     const NS = 'selection-translator'
     const ROUTE = '/api/dsh/selection-translator'
     const TRANSLATED_ATTR = 'data-dsh-translated'
+    const BLOCK_SELECTOR = 'p, li, h1, h2, h3, h4, h5, h6, blockquote, dt, dd, td, th, figcaption, div'
+    const OPAQUE_SELECTOR = 'pre, code, kbd, samp, textarea'
+    const MEDIA_SELECTOR = 'img, svg, math, video, audio, canvas'
+    const SKIP_SELECTOR = OPAQUE_SELECTOR + ', ' + MEDIA_SELECTOR + ', [data-dsh-translated]'
+    const MAX_BLOCK_CHARS = 3400
+    const BATCH_SIZE = 8
 
     const DICTS = {
       'zh-CN': {
         copy: '复制',
         translate: '翻译成中文',
         restore: '取消翻译',
-        translating: '正在翻译…',
+        translating: '正在翻译',
         failed: '翻译失败，请重试',
-        tooLong: '选中的文字过长，请缩短后再试',
         empty: '没有可翻译的文字',
         untitled: '已翻译 · 右键可还原',
       },
@@ -23,16 +28,15 @@ window.__ModuleLoader__.load({
         copy: 'Copy',
         translate: 'Translate to Chinese',
         restore: 'Undo translation',
-        translating: 'Translating…',
+        translating: 'Translating',
         failed: 'Translation failed, please retry',
-        tooLong: 'Selection is too long, please shorten it',
         empty: 'Nothing to translate',
         untitled: 'Translated · right-click to restore',
       },
     }
 
     const CSS = `
-      .dsh-st-menu{position:fixed;z-index:2147483000;min-width:184px;max-width:280px;padding:5px;border-radius:10px;background:var(--dsw-alias-bg-overlay,#ffffff);border:1px solid var(--dsw-alias-border-l1,rgba(15,23,42,.12));box-shadow:0 10px 30px rgba(15,23,42,.18);font-family:inherit;font-size:13px;line-height:1.4;color:var(--dsw-alias-label-primary,#0f172a);-webkit-user-select:none;user-select:none;pointer-events:auto}
+      .dsh-st-menu{position:fixed;z-index:2147483000;min-width:196px;max-width:300px;padding:5px;border-radius:10px;background:var(--dsw-alias-bg-overlay,#ffffff);border:1px solid var(--dsw-alias-border-l1,rgba(15,23,42,.12));box-shadow:0 10px 30px rgba(15,23,42,.18);font-family:inherit;font-size:13px;line-height:1.4;color:var(--dsw-alias-label-primary,#0f172a);-webkit-user-select:none;user-select:none;pointer-events:auto}
       .dsh-st-item{display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:7px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;outline:none}
       .dsh-st-item:hover{background:var(--dsw-alias-bg-layer-2,rgba(15,23,42,.07))}
       .dsh-st-item[data-disabled="true"]{opacity:.6;cursor:default}
@@ -40,11 +44,17 @@ window.__ModuleLoader__.load({
       .dsh-st-icon{display:inline-flex;width:16px;height:16px;flex:none;align-items:center;justify-content:center;opacity:.85}
       .dsh-st-sep{height:1px;margin:4px 6px;background:var(--dsw-alias-border-l1,rgba(15,23,42,.1))}
       .dsh-st-error{font-size:11px;line-height:1.4;color:var(--dsw-alias-state-error-primary,#dc2626);padding:3px 10px 4px;white-space:normal}
+      .dsh-st-progress{display:flex;flex-direction:column;gap:5px;padding:5px 10px 3px}
+      .dsh-st-progress-track{height:4px;border-radius:999px;background:var(--dsw-alias-bg-layer-2,rgba(15,23,42,.1));overflow:hidden}
+      .dsh-st-progress-fill{height:100%;border-radius:999px;background:var(--dsw-alias-brand-primary,#4d6bfe);transition:width .2s ease}
+      .dsh-st-progress-label{display:flex;justify-content:space-between;gap:10px;font-size:11px;color:var(--dsw-alias-label-secondary,#64748b)}
       .dsh-st-translated{text-decoration:underline dotted currentColor;text-decoration-thickness:1px;text-underline-offset:2px;cursor:text}
     `
 
-    /** Original DOM fragments of in-place translations, keyed by their span. */
+    /** span -> the translation group it belongs to. */
     const records = new Map()
+    /** Every group currently applied, for disposal. */
+    const groups = new Set()
 
     /**
      * The menu is deliberately Chinese-only: the caller asked for 汉字 labels
@@ -74,35 +84,256 @@ window.__ModuleLoader__.load({
       return false
     }
 
-    /** Put `translated` where the selection was and keep the original nodes detached. */
-    function markTranslated(range, translated, originalTitle) {
+    /** Latin/Cyrillic/Greek/Arabic/Indic/kana/Hangul: worth sending to a zh target. */
+    const LETTER_RE = /[A-Za-z\u00C0-\u024F\u0370-\u04FF\u0590-\u05FF\u0600-\u06FF\u0900-\u097F\u3040-\u30FF\uAC00-\uD7AF]/
+
+    function hasLetter(text) {
+      return LETTER_RE.test(text)
+    }
+
+    function collectTextNodes(range) {
+      const root = range.commonAncestorContainer
+      const container = root.nodeType === Node.TEXT_NODE ? root.parentNode : root
+      if (!container) return []
+      const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT)
+      const nodes = []
+      let node
+      while ((node = walker.nextNode())) {
+        if (!node.nodeValue) continue
+        if (!range.intersectsNode(node)) continue
+        nodes.push(node)
+      }
+      return nodes
+    }
+
+    function coversBlock(range, block) {
+      try {
+        const whole = document.createRange()
+        whole.selectNodeContents(block)
+        return range.compareBoundaryPoints(0, whole) <= 0 && range.compareBoundaryPoints(2, whole) >= 0
+      } catch {
+        return false
+      }
+    }
+
+    /**
+     * A block that nests other blocks (a list item holding a paragraph, a div
+     * holding sections) must not be rebuilt as a leaf: its nested content is
+     * owned by those inner blocks.
+     */
+    function hasNestedBlock(block) {
+      for (const child of block.querySelectorAll(BLOCK_SELECTOR)) {
+        if (child !== block) return true
+      }
+      return false
+    }
+
+    function buildBlockSource(block) {
+      const codeNodes = []
+      let source = ''
+      const walk = (parent) => {
+        for (const child of parent.childNodes) {
+          if (child.nodeType === Node.TEXT_NODE) {
+            source += child.nodeValue
+            continue
+          }
+          if (child.nodeType !== Node.ELEMENT_NODE) continue
+          if (child.matches(OPAQUE_SELECTOR) || child.matches(MEDIA_SELECTOR)) {
+            const index = codeNodes.length
+            codeNodes.push(child)
+            source += '[[' + index + ']]'
+            continue
+          }
+          if (child.tagName === 'BR') {
+            source += '\n'
+            continue
+          }
+          if (child.matches('script, style')) continue
+          if (child !== block && child.matches(BLOCK_SELECTOR)) continue
+          walk(child)
+        }
+      }
+      walk(block)
+      return { source, codeNodes }
+    }
+
+    function segmentForNode(node, range) {
+      const value = node.nodeValue || ''
+      let start = 0
+      let end = value.length
+      if (node === range.startContainer) start = range.startOffset
+      if (node === range.endContainer) end = range.endOffset
+      if (start >= end) return null
+      const text = value.slice(start, end)
+      const leading = (text.match(/^\s+/) || [''])[0]
+      const trailing = (text.match(/\s+$/) || [''])[0]
+      const core = text.slice(leading.length, text.length - trailing.length)
+      if (core === '') return null
+      return {
+        start: start + leading.length,
+        end: end - trailing.length,
+        prefix: leading,
+        suffix: trailing,
+        core,
+      }
+    }
+
+    /**
+     * Split the selection into translation units. A fully selected block is
+     * rebuilt from one request (code elements travel as placeholders); a
+     * partially selected block is translated text-node by text-node.
+     */
+    function planUnits(range) {
+      const nodes = collectTextNodes(range)
+      const blockMap = new Map()
+      for (const node of nodes) {
+        const parent = node.parentElement
+        if (!parent) continue
+        if (parent.closest(SKIP_SELECTOR)) continue
+        const block = parent.closest(BLOCK_SELECTOR)
+        if (!block || !block.isConnected) continue
+        const list = blockMap.get(block)
+        if (list) list.push(node)
+        else blockMap.set(block, [node])
+      }
+
+      const units = []
+      for (const [block, blockNodes] of blockMap) {
+        if (!hasNestedBlock(block) && coversBlock(range, block)) {
+          const built = buildBlockSource(block)
+          if (hasLetter(built.source) && built.source.length <= MAX_BLOCK_CHARS) {
+            units.push({ kind: 'block', block, source: built.source, codeNodes: built.codeNodes })
+            continue
+          }
+        }
+        for (const node of blockNodes) {
+          const segment = segmentForNode(node, range)
+          if (!segment || !hasLetter(segment.core)) continue
+          units.push({
+            kind: 'text',
+            node,
+            start: segment.start,
+            end: segment.end,
+            core: segment.core,
+            source: segment.core,
+          })
+        }
+      }
+      return units
+    }
+
+    function applyBlock(unit, translated, title) {
+      const { block, codeNodes } = unit
+      if (!block.isConnected) return null
+      const original = document.createDocumentFragment()
+      while (block.firstChild) original.append(block.firstChild)
+
+      const spans = []
+      const appendText = (text) => {
+        if (text === '') return
+        if (text.trim() === '') {
+          block.append(document.createTextNode(text))
+          return
+        }
+        const span = document.createElement('span')
+        span.className = 'dsh-st-translated'
+        span.setAttribute(TRANSLATED_ATTR, '1')
+        span.title = title
+        span.textContent = text
+        block.append(span)
+        spans.push(span)
+      }
+
+      const placed = new Set()
+      const pattern = /\[\[(\d+)\]\]/g
+      let lastIndex = 0
+      let match
+      while ((match = pattern.exec(translated)) !== null) {
+        appendText(translated.slice(lastIndex, match.index))
+        const index = Number(match[1])
+        const code = codeNodes[index]
+        if (code) {
+          block.append(code.cloneNode(true))
+          placed.add(index)
+        }
+        lastIndex = pattern.lastIndex
+      }
+      appendText(translated.slice(lastIndex))
+
+      for (let index = 0; index < codeNodes.length; index += 1) {
+        if (!placed.has(index)) block.append(codeNodes[index].cloneNode(true))
+      }
+
+      if (spans.length === 0) {
+        block.replaceChildren(original)
+        return null
+      }
+      return { block, original, spans }
+    }
+
+    function applyText(unit, translated, title) {
+      const { node, start, end, core } = unit
+      if (!node.isConnected) return null
+      const range = document.createRange()
+      try {
+        range.setStart(node, start)
+        range.setEnd(node, end)
+      } catch {
+        return null
+      }
       const span = document.createElement('span')
       span.className = 'dsh-st-translated'
       span.setAttribute(TRANSLATED_ATTR, '1')
-      span.title = originalTitle || ''
+      span.title = title
       span.textContent = translated
-      const original = range.extractContents()
-      records.set(span, { fragment: original })
-      range.insertNode(span)
-      return span
+      try {
+        range.surroundContents(span)
+      } catch {
+        return null
+      }
+      return { span, original: core }
     }
 
-    function restoreTranslated(span) {
-      if (!(span instanceof Element) || !span.isConnected) return
-      const record = records.get(span)
-      if (record === undefined) {
-        span.replaceWith(document.createTextNode(span.textContent || ''))
-        return
+    function applyUnits(units, results, group, title) {
+      let applied = 0
+      units.forEach((unit, index) => {
+        const result = results[index]
+        if (!result || result.ok !== true || typeof result.text !== 'string') return
+        const translated = result.text.trim()
+        if (translated === '' || translated === unit.source.trim()) return
+        if (unit.kind === 'block') {
+          const entry = applyBlock(unit, translated, title)
+          if (!entry) return
+          group.blocks.push(entry)
+          for (const span of entry.spans) records.set(span, group)
+          applied += 1
+          return
+        }
+        const entry = applyText(unit, translated, title)
+        if (!entry) return
+        group.texts.push(entry)
+        records.set(entry.span, group)
+        applied += 1
+      })
+      return applied
+    }
+
+    function restoreGroup(group) {
+      if (!group || group.done) return
+      group.done = true
+      for (const entry of group.blocks) {
+        for (const span of entry.spans) records.delete(span)
+        if (entry.block.isConnected) entry.block.replaceChildren(entry.original)
       }
-      records.delete(span)
-      span.replaceWith(record.fragment)
+      for (const entry of group.texts) {
+        records.delete(entry.span)
+        if (entry.span.isConnected) entry.span.replaceWith(document.createTextNode(entry.original))
+      }
+      groups.delete(group)
     }
 
     function restoreAll() {
-      for (const [span, record] of records) {
-        if (span.isConnected) span.replaceWith(record.fragment)
-      }
-      records.clear()
+      for (const group of [...groups]) restoreGroup(group)
     }
 
     async function copyText(text) {
@@ -143,11 +374,12 @@ window.__ModuleLoader__.load({
       }
     }
 
-    async function requestTranslation(text) {
+    async function fetchBatch(texts, signal) {
       const response = await fetch(ROUTE, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ text, target: 'zh' }),
+        body: JSON.stringify({ texts }),
+        signal,
       })
       let payload
       try {
@@ -155,13 +387,10 @@ window.__ModuleLoader__.load({
       } catch {
         payload = null
       }
-      if (!response.ok || payload === null || payload.ok !== true || typeof payload.text !== 'string') {
-        const reason = payload && typeof payload.error === 'string' ? payload.error : 'http-' + response.status
-        const error = new Error(reason)
-        error.code = reason
-        throw error
+      if (!response.ok || payload === null || payload.ok !== true || !Array.isArray(payload.results)) {
+        throw new Error(payload && typeof payload.error === 'string' ? payload.error : 'http-' + response.status)
       }
-      return payload.text
+      return payload.results
     }
 
     function Icon(props) {
@@ -205,19 +434,26 @@ window.__ModuleLoader__.load({
         const [menu, setMenu] = React.useState(null)
         const menuRef = React.useRef(null)
         const openRef = React.useRef(false)
+        const jobRef = React.useRef(null)
 
         React.useEffect(() => {
           openRef.current = menu !== null
         }, [menu])
 
         React.useEffect(() => {
-          const close = () => setMenu(null)
+          const close = () => {
+            if (jobRef.current !== null) {
+              jobRef.current.abort()
+              jobRef.current = null
+            }
+            setMenu(null)
+          }
           /** Selection captured on right mousedown, before the native menu reads it. */
           let pending = null
 
           const place = (x, y) => {
-            const width = 210
-            const height = menuRef.current ? menuRef.current.offsetHeight : 96
+            const width = 220
+            const height = menuRef.current ? menuRef.current.offsetHeight : 168
             const left = Math.max(8, Math.min(x, window.innerWidth - width - 8))
             const top = Math.max(8, Math.min(y, window.innerHeight - height - 8))
             return { left, top }
@@ -262,6 +498,7 @@ window.__ModuleLoader__.load({
                 span: translated,
                 range: null,
                 busy: false,
+                progress: null,
                 error: '',
               })
               return
@@ -285,6 +522,7 @@ window.__ModuleLoader__.load({
               range: snapshot.range,
               span: null,
               busy: false,
+              progress: null,
               error: '',
             })
           }
@@ -328,17 +566,68 @@ window.__ModuleLoader__.load({
         if (menu === null) return styleElement
 
         const translateAction = async () => {
-          if (menu.busy) return
-          setMenu((current) => (current === null ? current : { ...current, busy: true, error: '' }))
+          if (menu.busy || !menu.range) return
+          if (jobRef.current !== null) jobRef.current.abort()
+          const controller = new AbortController()
+          jobRef.current = controller
+
+          let units
           try {
-            if (!menu.range || !menu.range.startContainer.isConnected) throw new Error('selection-lost')
-            const translated = await requestTranslation(menu.text)
-            markTranslated(menu.range, translated, t('untitled'))
+            units = planUnits(menu.range)
+          } catch {
+            units = []
+          }
+          if (units.length === 0) {
+            setMenu((current) => (current === null ? current : { ...current, error: t('empty') }))
+            jobRef.current = null
+            return
+          }
+
+          const group = { blocks: [], texts: [], done: false }
+          setMenu((current) => (current === null ? current : {
+            ...current,
+            busy: true,
+            error: '',
+            progress: { done: 0, total: units.length },
+          }))
+
+          try {
+            const results = []
+            for (let offset = 0; offset < units.length; offset += BATCH_SIZE) {
+              const slice = units.slice(offset, offset + BATCH_SIZE)
+              const batch = await fetchBatch(slice.map((unit) => unit.source), controller.signal)
+              results.push(...batch)
+              setMenu((current) => (current === null ? current : {
+                ...current,
+                progress: { done: Math.min(offset + slice.length, units.length), total: units.length },
+              }))
+            }
+            if (controller.signal.aborted) return
+            const applied = applyUnits(units, results, group, t('untitled'))
+            if (applied === 0) throw new Error('translation-failed')
+            groups.add(group)
             setMenu(null)
           } catch (error) {
-            const message = error && error.code === 'text-too-long' ? t('tooLong') : t('failed')
-            setMenu((current) => (current === null ? current : { ...current, busy: false, error: message }))
+            if (controller.signal.aborted) return
+            setMenu((current) => (current === null ? current : { ...current, busy: false, error: t('failed') }))
+          } finally {
+            if (jobRef.current === controller) jobRef.current = null
           }
+        }
+
+        const action = () => {
+          if (menu.busy) return
+          if (menu.mode === 'restore') {
+            const span = menu.span
+            setMenu(null)
+            if (span) {
+              const group = records.get(span)
+              if (group) restoreGroup(group)
+              else if (span.isConnected) span.replaceWith(document.createTextNode(span.textContent || ''))
+            }
+            return
+          }
+          void translateAction()
         }
 
         const actionLabel = menu.busy
@@ -346,17 +635,6 @@ window.__ModuleLoader__.load({
           : menu.mode === 'restore'
             ? t('restore')
             : t('translate')
-
-        const action = () => {
-          if (menu.busy) return
-          if (menu.mode === 'restore') {
-            const span = menu.span
-            setMenu(null)
-            restoreTranslated(span)
-            return
-          }
-          void translateAction()
-        }
 
         const children = [
           h('div', {
@@ -379,6 +657,20 @@ window.__ModuleLoader__.load({
 
         if (menu.error !== '') {
           children.push(h('div', { key: 'error', className: 'dsh-st-error' }, menu.error))
+        }
+
+        if (menu.busy) {
+          const done = menu.progress ? menu.progress.done : 0
+          const total = menu.progress ? menu.progress.total : 0
+          const percent = total > 0 ? Math.round((done / total) * 100) : 0
+          children.push(h('div', { key: 'progress', className: 'dsh-st-progress' }, [
+            h('div', { key: 'track', className: 'dsh-st-progress-track' },
+              h('div', { key: 'fill', className: 'dsh-st-progress-fill', style: { width: percent + '%' } })),
+            h('div', { key: 'label', className: 'dsh-st-progress-label' }, [
+              h('span', { key: 'text' }, t('translating')),
+              h('span', { key: 'count' }, done + '/' + total),
+            ]),
+          ]))
         }
 
         children.push(h('div', {
