@@ -54,7 +54,7 @@ dsh-selection-translator
 
 ## 开发与发布
 
-见 [PUBLISHING.md](PUBLISHING.md)。
+见 [PUBLISHING.md](PUBLISHING.md)；上架 DSH 插件市场见 [MARKET.md](MARKET.md)。
 
 ## License
 

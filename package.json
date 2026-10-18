@@ -35,14 +35,6 @@
       "immediately": true
     }
   },
-  "peerDependencies": {
-    "@deepseek-ai/dsh": ">=0.1.7-rc.1"
-  },
-  "peerDependenciesMeta": {
-    "@deepseek-ai/dsh": {
-      "optional": true
-    }
-  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/DevinMx520/dsh-selection-translator.git"
