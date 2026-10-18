@@ -1,0 +1,5 @@
+- insert:
+    - id: selection-translator-translator
+      name: '@deepseek-ai/dsh-experimental-translator'
+    - id: selection-translator
+      name: 'dsh-selection-translator'

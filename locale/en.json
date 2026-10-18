@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Selection Translator",
+    "description": "Right-click selected text to translate it in place; right-click the translated text again to restore the original."
+  }
+}

@@ -1,0 +1,56 @@
+{
+  "name": "dsh-selection-translator",
+  "version": "0.1.0",
+  "description": "Right-click selected text in the DeepSeek Harness Web UI to translate it in place, and restore the original with one more right-click.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "selection-translation",
+    "in-place-translation",
+    "bing"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": ">=0.1.7-rc.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh": {
+      "optional": true
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DevinMx520/dsh-selection-translator.git"
+  },
+  "homepage": "https://github.com/DevinMx520/dsh-selection-translator#readme",
+  "bugs": {
+    "url": "https://github.com/DevinMx520/dsh-selection-translator/issues"
+  },
+  "author": "DevinMx520"
+}
+

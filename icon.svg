@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="Selection translator">
+  <rect x="3" y="3" width="58" height="58" rx="15" fill="#4D6BFE"/>
+  <path d="M13 34.5c0-6.4 5.2-11.5 11.5-11.5h4.4v-3.2l6.6 5.3-6.6 5.3V27h-4.4c-4.1 0-7.5 3.3-7.5 7.5S20.4 42 24.5 42H26v4h-1.5C18.2 46 13 40.9 13 34.5Z" fill="#FFFFFF" opacity="0.9"/>
+  <path d="M30 29.5c0-6.4 5.2-11.5 11.5-11.5H47v4h-5.5c-4.1 0-7.5 3.3-7.5 7.5s3.4 7.5 7.5 7.5H44v4h-2.5C35.2 41 30 35.9 30 29.5Z" fill="#FFFFFF" opacity="0.55"/>
+  <text x="24" y="44" font-family="Segoe UI, Arial, sans-serif" font-size="19" font-weight="700" fill="#FFFFFF" text-anchor="middle">A</text>
+  <text x="43" y="44" font-family="Microsoft YaHei, PingFang SC, sans-serif" font-size="19" font-weight="700" fill="#FFFFFF" text-anchor="middle">文</text>
+</svg>
