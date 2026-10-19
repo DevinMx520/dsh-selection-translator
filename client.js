@@ -285,12 +285,14 @@ window.__ModuleLoader__.load({
       span.className = 'dsh-st-translated'
       span.setAttribute(TRANSLATED_ATTR, '1')
       span.title = title
-      span.textContent = translated
       try {
+        // surroundContents moves the selected original text INTO the span, so
+        // the translation must be written after it returns.
         range.surroundContents(span)
       } catch {
         return null
       }
+      span.textContent = translated
       return { span, original: core }
     }
 
